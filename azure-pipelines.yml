@@ -1,0 +1,224 @@
+# Azure DevOps Pipeline for PQLint TMDL Analysis
+# Triggers when .tmdl files change and runs linting on table definition files
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - '**/*.tmdl'
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - '**/*.tmdl'
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - group: PQLint_Variables
+  - name: modulePathRoot
+    value: '$(Build.SourcesDirectory)\ci_cd'
+  - name: tablesPath
+    value: '$(Build.SourcesDirectory)\SampleModel.SemanticModel\definition\tables'
+  - name: definitionPath
+    value: '$(Build.SourcesDirectory)\SampleModel.SemanticModel\definition'
+
+stages:
+- stage: TMDLLinting
+  displayName: 'TMDL Code Linting'
+  jobs:
+  - job: RunPQLint
+    displayName: 'Run PQLint on TMDL Files'
+    
+    steps:
+    - checkout: self
+      displayName: 'Checkout source code'
+    
+    - task: PowerShell@2
+      displayName: 'Import PQLintAPI Module and Run Linting'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Set error action preference
+          $ErrorActionPreference = "Stop"
+          
+          # Import the PQLintAPI module
+          $modulePath = "$(modulePathRoot)\PQLintAPI.psm1"
+          Write-Host "Importing PQLintAPI module from: $modulePath"
+          
+          if (-not (Test-Path $modulePath)) {
+              throw "PQLintAPI.psm1 not found at: $modulePath"
+          }
+          
+          Import-Module $modulePath -Force
+          Write-Host "Successfully imported PQLintAPI module"
+          
+          # Get subscription key from environment variable
+          $subscriptionKey = $env:PQLINT_SUBSCRIPTION_KEY
+          if ([string]::IsNullOrWhiteSpace($subscriptionKey)) {
+              throw "PQLINT_SUBSCRIPTION_KEY environment variable is not set or is empty"
+          }
+          
+          # Define the tables directory path
+          $tablesDirectory = "$(tablesPath)"
+          $definitionDirectory = "$(definitionPath)"
+          Write-Host "Scanning for TMDL files in: $tablesDirectory"
+          Write-Host "Also checking expressions.tmdl in: $definitionDirectory"
+          
+          if (-not (Test-Path $tablesDirectory)) {
+              throw "Tables directory not found at: $tablesDirectory"
+          }
+          
+          if (-not (Test-Path $definitionDirectory)) {
+              throw "Definition directory not found at: $definitionDirectory"
+          }
+          
+          # Get all .tmdl files in the tables directory
+          $tmdlFiles = Get-ChildItem -Path $tablesDirectory -Filter "*.tmdl" -File
+          
+          # Add expressions.tmdl file if it exists
+          $expressionsFile = Join-Path $definitionDirectory "expressions.tmdl"
+          if (Test-Path $expressionsFile) {
+              $tmdlFiles += Get-Item $expressionsFile
+              Write-Host "Added expressions.tmdl to analysis list"
+          } else {
+              Write-Warning "expressions.tmdl not found at: $expressionsFile"
+          }
+          
+          if ($tmdlFiles.Count -eq 0) {
+              Write-Host "No .tmdl files found in the tables directory"
+              exit 0
+          }
+          
+          Write-Host "Found $($tmdlFiles.Count) TMDL files to analyze"
+          
+          # Initialize counters and results
+          $totalIssues = 0
+          $allResults = @()
+          $hasErrors = $false
+          
+          # Process each TMDL file
+          foreach ($file in $tmdlFiles) {
+              Write-Host ""
+              Write-Host "========================================="
+              Write-Host "Analyzing file: $($file.Name)"
+              Write-Host "========================================="
+              
+              try {
+                  # Read the file content
+                  $fileContent = Get-Content -Path $file.FullName -Raw -Encoding UTF8
+                  
+                  if ([string]::IsNullOrWhiteSpace($fileContent)) {
+                      Write-Warning "File $($file.Name) is empty, skipping..."
+                      continue
+                  }
+                  
+                  # Run PQLint analysis
+                  Write-Host "Running PQLint analysis on $($file.Name)..."
+                  $results = Invoke-CodeLinting -Code $fileContent -SubscriptionKey $subscriptionKey -Format "tmdl"
+                  
+                  if ($results -and $results.Count -gt 0) {
+                      Write-Host "Found $($results.Count) issues in $($file.Name):"
+                      
+                      foreach ($result in $results) {
+                          $severityColor = switch ($result.Severity) {
+                              3 { "Red" }      # Error
+                              2 { "Yellow" }   # Warning
+                              1 { "Cyan" }     # Info
+                              default { "White" }
+                          }
+                          
+                          $severityText = switch ($result.Severity) {
+                              3 { "ERROR" }
+                              2 { "WARNING" }
+                              1 { "INFO" }
+                              default { "UNKNOWN" }
+                          }
+                          
+                          Write-Host "  [$severityText] $($result.Name)" -ForegroundColor $severityColor
+                          Write-Host "    Rule ID: $($result.ID)"
+                          Write-Host "    Category: $($result.Category)"
+                          Write-Host "    Description: $($result.Description)"
+                          
+                          if ($result.ErrorInformation) {
+                              Write-Host "    Location: Line $($result.ErrorInformation.errorLocation.positionStart.lineNumber)"
+                          }
+                          
+                          Write-Host ""
+                          
+                          # Track errors for pipeline failure
+                          if ($result.Severity -eq 3) {
+                              $hasErrors = $true
+                          }
+                      }
+                      
+                      $totalIssues += $results.Count
+                      $allResults += $results | ForEach-Object { 
+                          $_ | Add-Member -NotePropertyName "FileName" -NotePropertyValue $file.Name -PassThru 
+                      }
+                  } else {
+                      Write-Host "✅ No issues found in $($file.Name)" -ForegroundColor Green
+                  }
+              }
+              catch {
+                  Write-Error "Failed to analyze $($file.Name): $($_.Exception.Message)"
+                  $hasErrors = $true
+              }
+          }
+          
+          # Summary
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host "ANALYSIS SUMMARY"
+          Write-Host "========================================="
+          Write-Host "Files analyzed: $($tmdlFiles.Count)"
+          Write-Host "Total issues found: $totalIssues"
+          
+          if ($totalIssues -gt 0) {
+              $errorCount = ($allResults | Where-Object { $_.Severity -eq 3 }).Count
+              $warningCount = ($allResults | Where-Object { $_.Severity -eq 2 }).Count
+              $infoCount = ($allResults | Where-Object { $_.Severity -eq 1 }).Count
+              
+              Write-Host "  - Errors: $errorCount" -ForegroundColor Red
+              Write-Host "  - Warnings: $warningCount" -ForegroundColor Yellow
+              Write-Host "  - Info: $infoCount" -ForegroundColor Cyan
+          }
+          
+          # Export results for potential artifact publishing
+          if ($allResults.Count -gt 0) {
+              $resultsJson = $allResults | ConvertTo-Json -Depth 10
+              $resultsPath = "$(Agent.TempDirectory)\pqlint-results.json"
+              $resultsJson | Out-File -FilePath $resultsPath -Encoding UTF8
+              Write-Host "Results exported to: $resultsPath"
+              
+              # Set pipeline variable for artifacts
+              Write-Host "##vso[task.setvariable variable=HasLintResults]true"
+              Write-Host "##vso[task.setvariable variable=ResultsPath]$resultsPath"
+          }
+          
+          # Fail the pipeline if there are errors
+          if ($hasErrors) {
+              Write-Host "❌ Pipeline failed due to linting errors" -ForegroundColor Red
+              exit 1
+          } else {
+              Write-Host "✅ All TMDL files passed linting checks" -ForegroundColor Green
+          }
+        pwsh: true
+      env:
+        PQLINT_SUBSCRIPTION_KEY: $(PQLINT_SUBSCRIPTION_KEY)
+    
+    # Optional: Publish linting results as pipeline artifact
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish PQLint Results'
+      condition: and(always(), eq(variables['HasLintResults'], 'true'))
+      inputs:
+        targetPath: $(ResultsPath)
+        artifactName: 'pqlint-results'
+        publishLocation: 'pipeline'

@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "tabOrder": [
+    "Sample.Tests",
+    "Measure.DEV.Tests",
+    "Example.ALL.Tests",
+    "Column.ALL.Tests",
+    "Table.ALL.Tests",
+    "Schema_Table.ALL.Tests",
+    "Schema_Model.ALL.Tests",
+    "Schema Query Example",
+    "NonTest",
+    "Query 1",
+    "Query 2",
+    "Query 3"
+  ],
+  "defaultTab": "Query 3"
+}
