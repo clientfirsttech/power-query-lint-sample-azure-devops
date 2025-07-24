@@ -2,7 +2,7 @@
 # Provides functions to interface with the PQLint API for linting Power Query M code and TMDL code
 
 # API Configuration
-$script:ApiBaseUrl = "https://api.pqlint.com/uat/v1"
+$script:ApiBaseUrl = "https://api.pqlint.com/v1"
 
 # Helper function to make HTTP requests with proper error handling
 function Invoke-PQLintApiRequest {
