@@ -1,0 +1,396 @@
+# Azure DevOps Pipeline for PQLint TMDL Analysis
+# Triggers when .tmdl files change and runs linting on table definition files
+
+trigger:
+  branches:
+    include:
+    - main
+  paths:
+    include:
+    - '**/*.tmdl'
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+  paths:
+    include:
+    - '**/*.tmdl'
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  - group: PQLint_Variables
+  - name: tablesPath
+    value: '$(Build.SourcesDirectory)\SampleModel.SemanticModel\definition\tables'
+  - name: definitionPath
+    value: '$(Build.SourcesDirectory)\SampleModel.SemanticModel\definition'
+
+stages:
+- stage: TMDLLinting
+  displayName: 'TMDL Code Linting'
+  jobs:
+  - job: RunPQLint
+    displayName: 'Run PQLint on TMDL Files'
+    steps:
+    - checkout: self
+      displayName: 'Checkout source code'
+    - task: PowerShell@2
+      displayName: 'Define PQLintAPI Functions and then Lint code'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # API Configuration
+          $script:ApiBaseUrl = "https://api.pqlint.com/v1"
+          
+          # PQLint API PowerShell Functions
+          # Provides functions to interface with the PQLint API for linting Power Query M code and TMDL code
+
+          # Helper function to make HTTP requests with proper error handling
+          function Invoke-PQLintApiRequest {
+              [CmdletBinding()]
+              param(
+                  [Parameter(Mandatory = $true)]
+                  [string]$Uri,
+                  
+                  [Parameter(Mandatory = $false)]
+                  [string]$Method = 'GET',
+                  
+                  [Parameter(Mandatory = $false)]
+                  [hashtable]$Headers = @{},
+                  
+                  [Parameter(Mandatory = $false)]
+                  [object]$Body,
+                  
+                  [Parameter(Mandatory = $false)]
+                  [string]$ContentType = 'application/json'
+              )
+              
+              try {
+                  $requestParams = @{
+                      Uri = $Uri
+                      Method = $Method
+                      Headers = $Headers
+                      ContentType = $ContentType
+                  }
+                  
+                  if ($Body) {
+                      if ($Body -is [hashtable] -or $Body -is [PSCustomObject]) {
+                          $requestParams.Body = ($Body | ConvertTo-Json -Depth 10)
+                      } else {
+                          $requestParams.Body = $Body
+                      }
+                  }
+                  
+                  $response = Invoke-RestMethod @requestParams
+                  return $response
+              }
+              catch {
+                  $errorDetails = $_.Exception.Message
+                  if ($_.Exception.Response) {
+                      $statusCode = $_.Exception.Response.StatusCode
+                      $statusDescription = $_.Exception.Response.StatusDescription
+                      
+                      try {
+                          $errorStream = $_.Exception.Response.GetResponseStream()
+                          $reader = New-Object System.IO.StreamReader($errorStream)
+                          $errorBody = $reader.ReadToEnd()
+                          $reader.Close()
+                          
+                          if ($errorBody) {
+                              $errorObject = $errorBody | ConvertFrom-Json
+                              $errorDetails = "HTTP $([int]$statusCode) $statusDescription - $($errorObject.body)"
+                          }
+                      }
+                      catch {
+                          $errorDetails = "HTTP $([int]$statusCode) $statusDescription - $errorDetails"
+                      }
+                  }
+                  
+                  throw "PQLint API Error: $errorDetails"
+              }
+          }
+
+          <#
+          .SYNOPSIS
+              Lints Power Query M code or TMDL code using the PQLint API.
+
+          .DESCRIPTION
+              This function sends code to the PQLint API for analysis and returns linting results.
+              Supports both Power Query M code and TMDL code with configurable options.
+
+          .PARAMETER Code
+              The multiline Power Query M code or TMDL code to lint. This parameter is mandatory.
+
+          .PARAMETER SubscriptionKey
+              The subscription key for API authorization. This parameter is mandatory.
+
+          .PARAMETER Rules
+              Optional array of rule IDs to apply. If not specified, all applicable rules will be used.
+
+          .PARAMETER Severity
+              Optional minimum severity level to include in results. 
+              For example: "3" for potential issues, "2" for best practices.
+
+          .PARAMETER Format
+              Optional format type. Either "pq" for Power Query M code or "tmdl" for TMDL code.
+              If not specified, defaults to "pq".
+
+          .EXAMPLE
+              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here"
+              
+              Lints the provided code using default settings.
+
+          .EXAMPLE
+              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here" -Format "tmdl" -Severity "2"
+              
+              Lints TMDL code with minimum severity level of 2 (best practices).
+
+          .EXAMPLE
+              $rules = @("rule1", "rule2")
+              Invoke-CodeLinting -Code $myCode -SubscriptionKey "your-key-here" -Rules $rules
+              
+              Lints code using only the specified rules.
+
+          .OUTPUTS
+              Array of PSCustomObject representing rule results with properties:
+              - ID: Rule identifier
+              - Name: Rule name
+              - Category: Rule category
+              - Description: Rule description
+              - Severity: Rule severity level
+              - ErrorInformation: Object containing error location and file path details
+          #>
+          function Invoke-CodeLinting {
+              [CmdletBinding()]
+              param(
+                  [Parameter(Mandatory = $true, ValueFromPipeline = $true)]
+                  [string]$Code,
+                  
+                  [Parameter(Mandatory = $true)]
+                  [string]$SubscriptionKey,
+                  
+                  [Parameter(Mandatory = $false)]
+                  [string[]]$Rules,
+                  
+                  [Parameter(Mandatory = $false)]
+                  [string]$Severity,
+                  
+                  [Parameter(Mandatory = $false)]
+                  [ValidateSet("pq", "tmdl")]
+                  [string]$Format = "pq"
+              )
+              
+              Write-Verbose "Linting code using PQLint API with format: $Format"
+              
+              if ([string]::IsNullOrWhiteSpace($Code)) {
+                  throw "Code parameter cannot be null or empty"
+              }
+              
+              if ([string]::IsNullOrWhiteSpace($SubscriptionKey)) {
+                  throw "SubscriptionKey parameter cannot be null or empty"
+              }
+              
+              # Build the request body
+              $requestBody = @{
+                  code = $Code
+              }
+              
+              # Add optional parameters
+              if ($Rules -and $Rules.Count -gt 0) {
+                  $requestBody.rules = $Rules
+              }
+              
+              $options = @{}
+              if (![string]::IsNullOrWhiteSpace($Severity)) {
+                  $options.severity = $Severity
+              }
+              if (![string]::IsNullOrWhiteSpace($Format)) {
+                  $options.format = $Format
+              }
+              
+              if ($options.Count -gt 0) {
+                  $requestBody.options = $options
+              }
+              
+              # Build the URI with subscription key
+              $uri = "$script:ApiBaseUrl/pq/lint?subscription-key=$([System.Web.HttpUtility]::UrlEncode($SubscriptionKey))"
+              try {
+                  $results = Invoke-PQLintApiRequest -Uri $uri -Method 'POST' -Body $requestBody -Verbose
+                  
+                  Write-Verbose "Successfully completed linting. Found $($results.Count) issues."
+                  return $results
+              }
+              catch {
+                  Write-Error "Failed to lint code: $($_.Exception.Message)"
+                  throw
+              }
+          }
+
+          # Set error action preference
+          $ErrorActionPreference = "Stop"
+          
+          # Get subscription key from environment variable
+          $subscriptionKey = $env:PQLINT_SUBSCRIPTION_KEY
+          if ([string]::IsNullOrWhiteSpace($subscriptionKey)) {
+              throw "PQLINT_SUBSCRIPTION_KEY environment variable is not set or is empty"
+          }
+          
+          # Define the tables directory path
+          $tablesDirectory = "$(tablesPath)"
+          $definitionDirectory = "$(definitionPath)"
+          Write-Host "Scanning for TMDL files in: $tablesDirectory"
+          Write-Host "Also checking expressions.tmdl in: $definitionDirectory"
+          
+          if (-not (Test-Path $tablesDirectory)) {
+              throw "Tables directory not found at: $tablesDirectory"
+          }
+          
+          if (-not (Test-Path $definitionDirectory)) {
+              throw "Definition directory not found at: $definitionDirectory"
+          }
+          
+          # Get all .tmdl files in the tables directory
+          $tmdlFiles = Get-ChildItem -Path $tablesDirectory -Filter "*.tmdl" -File
+          
+          # Add expressions.tmdl file if it exists
+          $expressionsFile = Join-Path $definitionDirectory "expressions.tmdl"
+          if (Test-Path $expressionsFile) {
+              $tmdlFiles += Get-Item $expressionsFile
+              Write-Host "Added expressions.tmdl to analysis list"
+          } else {
+              Write-Warning "expressions.tmdl not found at: $expressionsFile"
+          }
+          
+          if ($tmdlFiles.Count -eq 0) {
+              Write-Host "No .tmdl files found in the tables directory"
+              exit 0
+          }
+          
+          Write-Host "Found $($tmdlFiles.Count) TMDL files to analyze"
+          
+          # Initialize counters and results
+          $totalIssues = 0
+          $allResults = @()
+          $hasErrors = $false
+          
+          # Process each TMDL file
+          foreach ($file in $tmdlFiles) {
+              Write-Host ""
+              Write-Host "========================================="
+              Write-Host "Analyzing file: $($file.Name)"
+              Write-Host "========================================="
+              
+              try {
+                  # Read the file content
+                  $fileContent = Get-Content -Path $file.FullName -Raw -Encoding UTF8
+                  
+                  if ([string]::IsNullOrWhiteSpace($fileContent)) {
+                      Write-Warning "File $($file.Name) is empty, skipping..."
+                      continue
+                  }
+                  
+                  # Run PQLint analysis
+                  Write-Host "Running PQLint analysis on $($file.Name)..."
+                  $results = Invoke-CodeLinting -Code $fileContent -SubscriptionKey $subscriptionKey -Format "tmdl"
+                  
+                  if ($results -and $results.Count -gt 0) {
+                      Write-Host "Found $($results.Count) issues in $($file.Name):"
+                      
+                      foreach ($result in $results) {
+                          $severityColor = switch ($result.Severity) {
+                              3 { "Red" }      # Error
+                              2 { "Yellow" }   # Warning
+                              1 { "Cyan" }     # Info
+                              default { "White" }
+                          }
+                          
+                          $severityText = switch ($result.Severity) {
+                              3 { "ERROR" }
+                              2 { "WARNING" }
+                              1 { "INFO" }
+                              default { "UNKNOWN" }
+                          }
+                          
+                          Write-Host "  [$severityText] $($result.Name)" -ForegroundColor $severityColor
+                          Write-Host "    Rule ID: $($result.ID)"
+                          Write-Host "    Category: $($result.Category)"
+                          Write-Host "    Description: $($result.Description)"
+                          
+                          if ($result.ErrorInformation) {
+                              Write-Host "    Location: Line $($result.ErrorInformation.errorLocation.positionStart.lineNumber)"
+                          }
+                          
+                          Write-Host ""
+                          
+                          # Track errors for pipeline failure
+                          if ($result.Severity -eq 3) {
+                              $hasErrors = $true
+                          }
+                      }
+                      
+                      $totalIssues += $results.Count
+                      $allResults += $results | ForEach-Object { 
+                          $_ | Add-Member -NotePropertyName "FileName" -NotePropertyValue $file.Name -PassThru 
+                      }
+                  } else {
+                      Write-Host "✅ No issues found in $($file.Name)" -ForegroundColor Green
+                  }
+              }
+              catch {
+                  Write-Error "Failed to analyze $($file.Name): $($_.Exception.Message)"
+                  $hasErrors = $true
+              }
+          }
+          
+          # Summary
+          Write-Host ""
+          Write-Host "========================================="
+          Write-Host "ANALYSIS SUMMARY"
+          Write-Host "========================================="
+          Write-Host "Files analyzed: $($tmdlFiles.Count)"
+          Write-Host "Total issues found: $totalIssues"
+          
+          if ($totalIssues -gt 0) {
+              $errorCount = ($allResults | Where-Object { $_.Severity -eq 3 }).Count
+              $warningCount = ($allResults | Where-Object { $_.Severity -eq 2 }).Count
+              $infoCount = ($allResults | Where-Object { $_.Severity -eq 1 }).Count
+              
+              Write-Host "  - Errors: $errorCount" -ForegroundColor Red
+              Write-Host "  - Warnings: $warningCount" -ForegroundColor Yellow
+              Write-Host "  - Info: $infoCount" -ForegroundColor Cyan
+          }
+          
+          # Export results for potential artifact publishing
+          if ($allResults.Count -gt 0) {
+              $resultsJson = $allResults | ConvertTo-Json -Depth 10
+              $resultsPath = "$(Agent.TempDirectory)\pqlint-results.json"
+              $resultsJson | Out-File -FilePath $resultsPath -Encoding UTF8
+              Write-Host "Results exported to: $resultsPath"
+              
+              # Set pipeline variable for artifacts
+              Write-Host "##vso[task.setvariable variable=HasLintResults]true"
+              Write-Host "##vso[task.setvariable variable=ResultsPath]$resultsPath"
+          }
+          
+          # Fail the pipeline if there are errors
+          if ($hasErrors) {
+              Write-Host "❌ Pipeline failed due to linting errors" -ForegroundColor Red
+              exit 1
+          } else {
+              Write-Host "✅ All TMDL files passed linting checks" -ForegroundColor Green
+          }
+        pwsh: true
+      env:
+        PQLINT_SUBSCRIPTION_KEY: $(PQLINT_SUBSCRIPTION_KEY)
+    
+    # Optional: Publish linting results as pipeline artifact
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish PQLint Results'
+      condition: and(always(), eq(variables['HasLintResults'], 'true'))
+      inputs:
+        targetPath: $(ResultsPath)
+        artifactName: 'pqlint-results'
+        publishLocation: 'pipeline'
