@@ -19,7 +19,7 @@ pr:
     - '**/*.tmdl'
 
 pool:
-  vmImage: 'windows-latest'
+  vmImage: 'ubuntu-latest'
 
 variables:
   - group: PQLint_Variables
