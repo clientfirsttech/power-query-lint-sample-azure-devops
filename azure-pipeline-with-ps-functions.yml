@@ -366,7 +366,7 @@ stages:
           # Export results for potential artifact publishing
           if ($allResults.Count -gt 0) {
               $resultsJson = $allResults | ConvertTo-Json -Depth 10
-              $resultsPath = "$(Agent.TempDirectory)\pqlint-results.json"
+              $resultsPath = "$(Agent.TempDirectory)/pqlint-results.json"
               $resultsJson | Out-File -FilePath $resultsPath -Encoding UTF8
               Write-Host "Results exported to: $resultsPath"
               
